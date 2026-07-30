@@ -1,4 +1,4 @@
-import os
+kimport os
 import sys
 import logging
 import asyncio
@@ -8,8 +8,7 @@ from datetime import datetime, timedelta
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup, KeyboardButton
 from telegram.ext import Application, CommandHandler, MessageHandler, CallbackQueryHandler, filters, ContextTypes
 from sqlalchemy import create_engine, Column, Integer, String, DateTime, Boolean, BigInteger, ForeignKey, Text
-from sqlalchemy.ext.declarative import declarative_base
-from sqlalchemy.orm import sessionmaker
+from sqlalchemy.orm import sessionmaker, declarative_base
 from deep_translator import GoogleTranslator
 import qrcode
 import io
@@ -78,7 +77,6 @@ class KafeneioMessage(Base):
 
 # Database Engine & Session
 if not DATABASE_URL:
-    # Fallback to local SQLite if no DB URL is found (prevents immediate crash on boot)
     DATABASE_URL = "sqlite:///local_database.db"
     
 engine = create_engine(DATABASE_URL, echo=False)
@@ -230,7 +228,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     text = update.message.text
     
     if not text:
-        return  # Ignore messages without text (e.g., raw images without captions)
+        return
 
     with SessionLocal() as session:
         user = session.query(User).filter_by(telegram_user_id=user_id).first()
@@ -257,19 +255,16 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             await update.message.reply_text("☕ Type your anonymous message:")
 
         elif context.user_data.get('state') == 'WAITING_KOUSKOUS':
-            # This is where the code connects to the Kafeneio topic group
-            # e.g., await context.bot.send_message(chat_id=TOPIC_KOUSKOUS_ID, text=...)
             await update.message.reply_text("✅ Posted anonymously!")
             context.user_data['state'] = None
 
 # --- Cleanup Task --- #
 async def cleanup_db():
     while True:
-        await asyncio.sleep(86400) # Runs once a day
+        await asyncio.sleep(86400)
         try:
             with SessionLocal() as session:
                 limit = datetime.utcnow() - timedelta(days=15)
-                # Deletes records older than 15 days
                 session.query(ShiftSwap).filter(ShiftSwap.created_at < limit).delete()
                 session.query(KafeneioMessage).filter(KafeneioMessage.created_at < limit).delete()
                 session.commit()
@@ -277,20 +272,25 @@ async def cleanup_db():
         except Exception as e:
             logger.error(f"Cleanup task failed: {e}")
 
-# Ξεκινάμε την εκκαθάριση με ασφάλεια μέσω του post_init
 async def post_init(application: Application):
     asyncio.create_task(cleanup_db())
 
 def main() -> None:
+    # --- Python 3.14 Event Loop Fix ---
+    try:
+        loop = asyncio.get_event_loop()
+    except RuntimeError:
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+    # ----------------------------------
+    
     init_db()
-    # Εδώ δηλώνουμε το post_init για να τρέχουν τα background tasks
     application = Application.builder().token(TOKEN).post_init(post_init).build()
     
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CallbackQueryHandler(handle_callback))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     
-    # Το run_polling() δεν θέλει await, τρέχει τον δικό του "κινητήρα"
     application.run_polling()
 
 if __name__ == '__main__':
