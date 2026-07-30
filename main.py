@@ -1,32 +1,31 @@
-
 import os
+import sys
 import logging
 import asyncio
 import random
-import re
 from datetime import datetime, timedelta
-from typing import Dict, List, Optional
 
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup, KeyboardButton, InputFile
-from telegram.ext import Application, CommandHandler, MessageHandler, CallbackQueryHandler, filters, ContextTypes, ConversationFactory
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup, KeyboardButton
+from telegram.ext import Application, CommandHandler, MessageHandler, CallbackQueryHandler, filters, ContextTypes
 from sqlalchemy import create_engine, Column, Integer, String, DateTime, Boolean, BigInteger, ForeignKey, Text
 from sqlalchemy.ext.declarative import declarative_base
-from sqlalchemy.orm import sessionmaker, relationship
-from sqlalchemy.future import select
-from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession
+from sqlalchemy.orm import sessionmaker
 from deep_translator import GoogleTranslator
-import pytz
 import qrcode
-from PIL import Image
 import io
 
 # --- Configuration --- #
-TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+TOKEN = os.getenv("BOT_TOKEN") or os.getenv("TELEGRAM_BOT_TOKEN")
+
+if not TOKEN:
+    print("CRITICAL ERROR: BOT_TOKEN is missing from Environment Variables!")
+    sys.exit(1)
+
 DATABASE_URL = os.getenv("DATABASE_URL")
 if DATABASE_URL and DATABASE_URL.startswith("postgres://"):
-    DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql+asyncpg://", 1)
+    DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql://", 1)
 
-# Topic IDs (These should be set via environment variables or a config menu)
+# Topic IDs
 TOPIC_BEKA_ID = os.getenv("TOPIC_BEKA_ID")
 TOPIC_SHIFTS_ID = os.getenv("TOPIC_SHIFTS_ID")
 TOPIC_DETOURS_ID = os.getenv("TOPIC_DETOURS_ID")
@@ -57,8 +56,8 @@ class ShiftSwap(Base):
     id = Column(Integer, primary_key=True)
     offering_driver_id = Column(String, ForeignKey('users.driver_id'))
     requesting_driver_id = Column(String, ForeignKey('users.driver_id'), nullable=True)
-    shift_type = Column(String) # Früh, Tag, Mittel, Geteilt, Spät, Nacht, Frei
-    status = Column(String, default='SEARCHING') # SEARCHING, IN_PROGRESS, COMPLETED, CANCELLED
+    shift_type = Column(String) 
+    status = Column(String, default='SEARCHING') 
     created_at = Column(DateTime, default=datetime.utcnow)
 
 class GPXRoute(Base):
@@ -78,13 +77,16 @@ class KafeneioMessage(Base):
     created_at = Column(DateTime, default=datetime.utcnow)
 
 # Database Engine & Session
-engine = create_async_engine(DATABASE_URL, echo=False)
-AsyncSessionLocal = sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
+if not DATABASE_URL:
+    # Fallback to local SQLite if no DB URL is found (prevents immediate crash on boot)
+    DATABASE_URL = "sqlite:///local_database.db"
+    
+engine = create_engine(DATABASE_URL, echo=False)
+SessionLocal = sessionmaker(bind=engine, expire_on_commit=False)
 
-async def init_db():
-    async with engine.begin() as conn:
-        await conn.run_sync(Base.metadata.create_all)
-    logger.info("Database initialized.")
+def init_db():
+    Base.metadata.create_all(bind=engine)
+    logger.info("Database initialized successfully.")
 
 # --- Localization / Translation --- #
 LANGUAGES = {
@@ -110,7 +112,7 @@ async def translate_text(text, target_lang, source_lang='auto'):
 async def get_localized_text(user_language_code, key, **kwargs):
     messages = {
         "welcome": "Welcome colleague! 🚌 This is our independent and anonymous space.",
-        "choose_language": "🌐 Please choose your language / Παρακαλώ επιλέξτε γλώσσα:",
+        "choose_language": "🌐 Please choose your language:",
         "choose_specialty": "🛠️ What do you drive?",
         "registration_complete": "✅ Done! You are now {driver_id}. Keep it secret!",
         "back": "🔙 Back",
@@ -129,8 +131,6 @@ async def get_localized_text(user_language_code, key, **kwargs):
         "error_occurred": "Oops! Something went wrong. Try again.",
         "shift_type_prompt": "Which shift are you offering/looking for?",
         "shift_posted": "✅ Shift posted in the group!",
-        "proxy_chat_started": "🤝 Proxy chat started with another driver. You are anonymous.",
-        "proxy_chat_ended": "🛑 Chat ended. Identity protected.",
         "karma_update": "⭐ Karma updated! Current: {points}",
         "spam_warning": "⚠️ Slow down! Don't spam.",
         "racism_warning": "🚫 No racism or profanity allowed. Warning {count}/3.",
@@ -142,11 +142,11 @@ async def get_localized_text(user_language_code, key, **kwargs):
 
 # --- Helper Functions --- #
 async def generate_driver_id():
-    async with AsyncSessionLocal() as session:
+    with SessionLocal() as session:
         while True:
             driver_id = f"Driver #{random.randint(1000, 9999)}"
-            result = await session.execute(select(User).filter_by(driver_id=driver_id))
-            if not result.scalar_one_or_none():
+            existing = session.query(User).filter_by(driver_id=driver_id).first()
+            if not existing:
                 return driver_id
 
 async def get_main_menu_keyboard(user_language_code):
@@ -159,20 +159,18 @@ async def get_main_menu_keyboard(user_language_code):
 
 # --- Moderation & Anti-Spam --- #
 USER_LAST_MESSAGE_TIME = {}
-PROFANITY_LIST = ["racist_word1", "bad_word2"] # Expand this list or use a library
+PROFANITY_LIST = ["racist_word1", "bad_word2"]
 
 async def is_spam(user_id):
     now = datetime.now()
     if user_id in USER_LAST_MESSAGE_TIME:
         last_time = USER_LAST_MESSAGE_TIME[user_id]
-        if (now - last_time).total_seconds() < 2: # Max 1 msg per 2 seconds
+        if (now - last_time).total_seconds() < 2:
             return True
     USER_LAST_MESSAGE_TIME[user_id] = now
     return False
 
-async def check_moderation(update: Update, context: ContextTypes.DEFAULT_TYPE, user: User):
-    text = update.message.text or ""
-    # Simple profanity check (should be more advanced for 100+ languages)
+async def check_moderation(update: Update, context: ContextTypes.DEFAULT_TYPE, user: User, text: str):
     for word in PROFANITY_LIST:
         if word in text.lower():
             user.warnings += 1
@@ -187,16 +185,14 @@ async def check_moderation(update: Update, context: ContextTypes.DEFAULT_TYPE, u
 # --- Handlers --- #
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user_id = update.effective_user.id
-    async with AsyncSessionLocal() as session:
-        result = await session.execute(select(User).filter_by(telegram_user_id=user_id))
-        user = result.scalar_one_or_none()
+    with SessionLocal() as session:
+        user = session.query(User).filter_by(telegram_user_id=user_id).first()
 
         if user:
             msg = await get_localized_text(user.language_code, "already_registered", driver_id=user.driver_id)
             await update.message.reply_text(msg, reply_markup=await get_main_menu_keyboard(user.language_code))
             return
 
-    # Registration Start
     buttons = [[InlineKeyboardButton(name, callback_data=f"lang_{code}")] for code, name in LANGUAGES.items()]
     await update.message.reply_text("🌐 Choose Language:", reply_markup=InlineKeyboardMarkup(buttons))
 
@@ -206,10 +202,9 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     data = query.data
     user_id = query.from_user.id
 
-    async with AsyncSessionLocal() as session:
+    with SessionLocal() as session:
         if data.startswith("lang_"):
             lang = data.split("_")[1]
-            # Temporary store lang in context
             context.user_data['reg_lang'] = lang
             buttons = [
                 [InlineKeyboardButton("🚌 KOM", callback_data="spec_KOM")],
@@ -224,7 +219,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             driver_id = await generate_driver_id()
             new_user = User(telegram_user_id=user_id, driver_id=driver_id, language_code=lang, specialty=spec)
             session.add(new_user)
-            await session.commit()
+            session.commit()
             
             msg = await get_localized_text(lang, "registration_complete", driver_id=driver_id)
             await query.edit_message_text(msg)
@@ -234,20 +229,21 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     user_id = update.effective_user.id
     text = update.message.text
     
-    async with AsyncSessionLocal() as session:
-        result = await session.execute(select(User).filter_by(telegram_user_id=user_id))
-        user = result.scalar_one_or_none()
+    if not text:
+        return  # Ignore messages without text (e.g., raw images without captions)
+
+    with SessionLocal() as session:
+        user = session.query(User).filter_by(telegram_user_id=user_id).first()
         if not user or user.is_banned: return
 
         if await is_spam(user_id):
             await update.message.reply_text(await get_localized_text(user.language_code, "spam_warning"))
             return
 
-        if not await check_moderation(update, context, user):
-            await session.commit()
+        if not await check_moderation(update, context, user, text):
+            session.commit()
             return
 
-        # Main Menu Routing
         if text == await get_localized_text(user.language_code, "my_profile_qr"):
             qr_data = f"https://t.me/{context.bot.username}?start=ref_{user.driver_id}"
             qr = qrcode.make(qr_data)
@@ -261,24 +257,28 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             await update.message.reply_text("☕ Type your anonymous message:")
 
         elif context.user_data.get('state') == 'WAITING_KOUSKOUS':
-            # Post to Kafeneio Topic
-            translated_msg = f"🗣️ **{user.driver_id}**:\n{text}"
-            # Logic to send to TOPIC_KOUSKOUS_ID goes here
+            # This is where the code connects to the Kafeneio topic group
+            # e.g., await context.bot.send_message(chat_id=TOPIC_KOUSKOUS_ID, text=...)
             await update.message.reply_text("✅ Posted anonymously!")
             context.user_data['state'] = None
 
 # --- Cleanup Task --- #
 async def cleanup_db():
     while True:
-        await asyncio.sleep(86400) # Run daily
-        async with AsyncSessionLocal() as session:
-            # Delete old swaps and logs (logic here)
-            limit = datetime.utcnow() - timedelta(days=15)
-            # await session.execute(delete(ShiftSwap).where(ShiftSwap.created_at < limit))
-            await session.commit()
+        await asyncio.sleep(86400) # Runs once a day
+        try:
+            with SessionLocal() as session:
+                limit = datetime.utcnow() - timedelta(days=15)
+                # Deletes records older than 15 days
+                session.query(ShiftSwap).filter(ShiftSwap.created_at < limit).delete()
+                session.query(KafeneioMessage).filter(KafeneioMessage.created_at < limit).delete()
+                session.commit()
+                logger.info("Daily database cleanup completed.")
+        except Exception as e:
+            logger.error(f"Cleanup task failed: {e}")
 
 async def main() -> None:
-    await init_db()
+    init_db()
     application = Application.builder().token(TOKEN).build()
     
     application.add_handler(CommandHandler("start", start))
