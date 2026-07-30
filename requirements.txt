@@ -1,7 +1,7 @@
 python-telegram-bot==21.1.1
-SQLAlchemy==2.0.30
+SQLAlchemy
 psycopg2-binary==2.9.9
 deep-translator==1.11.4
 pytz==2024.1
 qrcode==7.4.2
-Pillow==10.4.0
+Pillow
