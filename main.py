@@ -277,16 +277,21 @@ async def cleanup_db():
         except Exception as e:
             logger.error(f"Cleanup task failed: {e}")
 
-async def main() -> None:
+# Ξεκινάμε την εκκαθάριση με ασφάλεια μέσω του post_init
+async def post_init(application: Application):
+    asyncio.create_task(cleanup_db())
+
+def main() -> None:
     init_db()
-    application = Application.builder().token(TOKEN).build()
+    # Εδώ δηλώνουμε το post_init για να τρέχουν τα background tasks
+    application = Application.builder().token(TOKEN).post_init(post_init).build()
     
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CallbackQueryHandler(handle_callback))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     
-    asyncio.create_task(cleanup_db())
-    await application.run_polling()
+    # Το run_polling() δεν θέλει await, τρέχει τον δικό του "κινητήρα"
+    application.run_polling()
 
 if __name__ == '__main__':
-    asyncio.run(main())
+    main()
